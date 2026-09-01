@@ -271,7 +271,7 @@ async function renderResults(root: HTMLDivElement, data: any) {
     container: sceneDiv,
     map: new Map({ basemap: "arcgis/topographic", ground: "world-elevation", layers: [sceneLayer] }),
     center: [x, y],
-    zoom: 17,
+    zoom: 14,
     ui: { components: ["attribution"] },
   });
   await currentSceneView.when();
