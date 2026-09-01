@@ -95,3 +95,18 @@ body { margin: 0; font-family: system-ui, sans-serif; background: #f4f3ef; }
 .spend-bar-row__track { flex: 1; height: 10px; background: #eee; border-radius: 4px; overflow: hidden; }
 .spend-bar-row__fill { height: 100%; background: #0f6e56; }
 .spend-bar-row__value { width: 46px; font-size: 12px; text-align: right; flex-shrink: 0; }
+
+.stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 4px; }
+
+.pyramid-legend { font-size: 11px; color: #666; margin-bottom: 8px; display: flex; align-items: center; }
+.pyramid-swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+.pyramid-swatch--m { background: #378add; }
+.pyramid-swatch--f { background: #d85a30; }
+
+.pyramid-row { display: flex; align-items: center; gap: 6px; height: 16px; margin: 3px 0; }
+.pyramid-row__side { flex: 1; height: 12px; display: flex; }
+.pyramid-row__side--m { justify-content: flex-end; }
+.pyramid-row__fill { height: 100%; }
+.pyramid-row__fill--m { background: #378add; }
+.pyramid-row__fill--f { background: #d85a30; }
+.pyramid-row__label { width: 44px; text-align: center; font-size: 11px; color: #666; flex-shrink: 0; }

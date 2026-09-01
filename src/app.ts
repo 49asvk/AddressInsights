@@ -10,6 +10,7 @@ import { geocodeAddress } from "./services/geocode";
 import { enrichPoint } from "./services/geoenrichment";
 import { nearbyPlaces, PLACE_CATEGORIES } from "./services/places";
 import { sampleElevation } from "./services/elevation";
+import { solveRoute, type RouteResult } from "./services/routing";
 
 let currentSceneView: SceneView | null = null;
 let miniViews: MapView[] = [];
@@ -39,43 +40,54 @@ export function renderApp(root: HTMLElement) {
   button.addEventListener("click", () => runSearch(input.value, results));
 }
 
+// Bump this whenever the bundle shape changes -- old cache entries under a
+// different version are ignored instead of rendering with stale/missing
+// fields (e.g. the enrichment field names changed entirely this round).
+const CACHE_VERSION = "v3";
+
 async function runSearch(addressText: string, results: HTMLDivElement) {
   if (!addressText) return;
 
-  // Bump this whenever the bundle shape changes -- old cache entries under
-  // a different version are ignored instead of crashing on load.
-    const CACHE_VERSION = "v2";
-    const cacheKey = `address-insights:${CACHE_VERSION}:${addressText.toLowerCase().trim()}`;
-    const cached = sessionStorage.getItem(cacheKey);
+  const cacheKey = `address-insights:${CACHE_VERSION}:${addressText.toLowerCase().trim()}`;
+  const cached = sessionStorage.getItem(cacheKey);
 
   results.innerHTML = `<calcite-loader label="Looking up address" active></calcite-loader>`;
 
-  let bundle: any;
+  let bundle: any = null;
 
   if (cached) {
-  bundle = JSON.parse(cached);
-  if (!bundle?.location) {
-    console.warn("Cached entry missing expected shape, re-fetching.");
-    bundle = null;
+    bundle = JSON.parse(cached);
+    if (!bundle?.location) {
+      console.warn("Cached entry missing expected shape, re-fetching.");
+      bundle = null;
+    }
   }
-}
-if (!bundle) {
+
+  if (!bundle) {
     const geocoded = await geocodeAddress(addressText);
     if (!geocoded) {
       results.innerHTML = `<calcite-notice open kind="danger"><div slot="message">No match found for that address.</div></calcite-notice>`;
       return;
     }
 
-    const [elevationResult, ringResult, enrichmentResult, placesResult] = await Promise.allSettled([
+    // Sample destination ~2-3km NE of the address -- a stand-in until
+    // Places is authorized, at which point this should route to a real
+    // result (e.g. coffeeShops[0]) instead.
+    const destX = geocoded.location.x + 0.02;
+    const destY = geocoded.location.y + 0.015;
+
+    const [elevationResult, ringResult, enrichmentResult, placesResult, routeResult] = await Promise.allSettled([
       sampleElevation(geocoded.location.x, geocoded.location.y),
       sampleElevationRing(geocoded.location.x, geocoded.location.y),
       enrichPoint(geocoded.location.x, geocoded.location.y),
       nearbyPlaces(geocoded.location.x, geocoded.location.y, PLACE_CATEGORIES.coffeeShops),
+      solveRoute(geocoded.location.x, geocoded.location.y, destX, destY),
     ]);
 
     if (elevationResult.status === "rejected") console.error("Elevation failed:", elevationResult.reason);
     if (enrichmentResult.status === "rejected") console.error("Enrichment failed:", enrichmentResult.reason);
     if (placesResult.status === "rejected") console.error("Places failed:", placesResult.reason);
+    if (routeResult.status === "rejected") console.error("Routing failed:", routeResult.reason);
 
     bundle = {
       address: geocoded.address,
@@ -86,6 +98,8 @@ if (!bundle) {
       elevationSamples: ringResult.status === "fulfilled" ? ringResult.value : [],
       enrichment: enrichmentResult.status === "fulfilled" ? enrichmentResult.value : null,
       coffeeShops: placesResult.status === "fulfilled" ? placesResult.value : null,
+      route: routeResult.status === "fulfilled" ? routeResult.value : null,
+      destination: { x: destX, y: destY },
     };
 
     sessionStorage.setItem(cacheKey, JSON.stringify(bundle));
@@ -107,34 +121,18 @@ function stdDev(values: number[]) {
   return Math.sqrt(variance);
 }
 
-// CS01 is inferred as the total from its magnitude relative to CS02..CS20,
-// not a confirmed field name -- verify against your account's Spending
-// data dictionary. IDX = index vs. national average (100 = average) is a
-// standard convention across most Esri demographic collections.
-function parseSpendingCategories(enrichment: Record<string, any>) {
-  const categories: { code: string; cy: number; perCapita: number; index: number }[] = [];
-  for (let i = 1; i <= 20; i++) {
-    const n = String(i).padStart(2, "0");
-    const cy = enrichment[`CS${n}_CY`];
-    if (cy == null) continue;
-    categories.push({
-      code: `CS${n}`,
-      cy,
-      perCapita: enrichment[`CSPC${n}_CY`],
-      index: enrichment[`CS${n}IDX_CY`],
-    });
-  }
-  return categories;
-}
-
 function formatCompact(n: number) {
   return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(n);
 }
 
-function pointGraphic(x: number, y: number) {
+function formatInt(n: number) {
+  return new Intl.NumberFormat().format(Math.round(n));
+}
+
+function pointGraphic(x: number, y: number, color = "#d85a30") {
   return new Graphic({
     geometry: { type: "point", x, y, spatialReference: { wkid: 4326 } } as any,
-    symbol: { type: "simple-marker", color: "#d85a30", outline: { color: "#ffffff", width: 1 }, size: 10 } as any,
+    symbol: { type: "simple-marker", color, outline: { color: "#ffffff", width: 1 }, size: 10 } as any,
   });
 }
 
@@ -167,10 +165,73 @@ function createMiniMap(container: HTMLDivElement, x: number, y: number, bufferMi
   return view;
 }
 
+const CONSUMER_STYLES: Record<string, string> = {
+  TYPE_A: "High Earning Urban Professionals",
+  TYPE_B: "Comfortably Off Empty Nesters",
+  TYPE_C: "Modern and Pragmatic Over 50s",
+  TYPE_D: "Well Informed Modern Consumers",
+  TYPE_E: "Affluent Highly Educated Urban Families",
+  TYPE_F: "Security-Oriented Seniors",
+  TYPE_G: "Orientation Seeking Lower and Middle Class Consumers",
+  TYPE_H: "Younger Lower and Middle Class Consumers",
+  TYPE_I: "Modern Younger Families",
+  TYPE_J: "Low-Income Younger Consumers",
+};
+
+function buildDominantSegment(enrichment: Record<string, any>) {
+  const entries = Object.entries(CONSUMER_STYLES)
+    .map(([code, label]) => ({ code, label, value: Number(enrichment[code]) || 0 }))
+    .sort((a, b) => b.value - a.value);
+  const total = entries.reduce((sum, e) => sum + e.value, 0) || 1;
+  const top = entries[0];
+  const maxVal = top?.value || 1;
+
+  return `
+    <div style="font-weight:600">${top.label}</div>
+    <div class="ai-card__stat">${((top.value / total) * 100).toFixed(1)}%</div>
+    <div class="ai-card__stat-label">Share of Consumer Styles population, 1-mile buffer (Esri India / MBR)</div>
+    <div style="margin-top:10px">
+      ${entries.map((e) => `
+        <div class="spend-bar-row">
+          <span class="spend-bar-row__label" style="width:34px" title="${e.label}">${e.code.replace("TYPE_", "")}</span>
+          <div class="spend-bar-row__track"><div class="spend-bar-row__fill" style="width:${(e.value / maxVal) * 100}%"></div></div>
+          <span class="spend-bar-row__value">${((e.value / total) * 100).toFixed(0)}%</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function buildAgePyramid(enrichment: Record<string, any>) {
+  const brackets = [
+    { label: "60+", m: enrichment.MAGE05_CY || 0, f: enrichment.FAGE05_CY || 0 },
+    { label: "45–59", m: enrichment.MAGE04_CY || 0, f: enrichment.FAGE04_CY || 0 },
+    { label: "30–44", m: enrichment.MAGE03_CY || 0, f: enrichment.FAGE03_CY || 0 },
+    { label: "15–29", m: enrichment.MAGE02_CY || 0, f: enrichment.FAGE02_CY || 0 },
+    { label: "0–14", m: enrichment.MAGE01_CY || 0, f: enrichment.FAGE01_CY || 0 },
+  ];
+  const max = Math.max(...brackets.flatMap((b) => [b.m, b.f]), 1);
+
+  return `
+    <div class="pyramid-legend"><span class="pyramid-swatch pyramid-swatch--m"></span>Male<span class="pyramid-swatch pyramid-swatch--f" style="margin-left:14px"></span>Female</div>
+    ${brackets.map((b) => `
+      <div class="pyramid-row">
+        <div class="pyramid-row__side pyramid-row__side--m"><div class="pyramid-row__fill pyramid-row__fill--m" style="width:${(b.m / max) * 100}%"></div></div>
+        <div class="pyramid-row__label">${b.label}</div>
+        <div class="pyramid-row__side pyramid-row__side--f"><div class="pyramid-row__fill pyramid-row__fill--f" style="width:${(b.f / max) * 100}%"></div></div>
+      </div>
+    `).join("")}
+  `;
+}
+
 async function renderResults(root: HTMLDivElement, data: any) {
   destroyAllViews();
 
-  const { address, score, location, rawAttributes, elevation, elevationSamples, enrichment, coffeeShops } = data;
+  const { address, score, location, rawAttributes, elevation, elevationSamples, enrichment, route: routeData, destination } = data as {
+    address: string; score: number; location: { x: number; y: number }; rawAttributes: any;
+    elevation: number | null; elevationSamples: number[]; enrichment: Record<string, any> | null;
+    route: RouteResult | null; destination: { x: number; y: number };
+  };
   const roughness = stdDev(elevationSamples || []);
   const x = location.x, y = location.y;
 
@@ -241,39 +302,64 @@ async function renderResults(root: HTMLDivElement, data: any) {
     <div class="ai-card__stat-label">Std. dev. of nearby elevation samples (real, derived)</div>
   `);
 
-  const coffeeCard = addCard("teal", "Coffee shops nearby", coffeeShops != null
-    ? `<div class="ai-card__stat">${coffeeShops.length}</div><div class="ai-card__stat-label">Within search radius</div><div class="ai-card__minimap"></div>`
+  const coffeeCard = addCard("teal", "Coffee shops nearby", data.coffeeShops != null
+    ? `<div class="ai-card__stat">${data.coffeeShops.length}</div><div class="ai-card__stat-label">Within search radius</div><div class="ai-card__minimap"></div>`
     : `<div class="ai-card__stat-label">Unavailable — check the Places privilege on your API key.</div><div class="ai-card__minimap"></div>`);
   createMiniMap(coffeeCard.querySelector(".ai-card__minimap")!, x, y);
 
   const parkingCard = addCard("teal", "Parking lots nearby", `
     <div class="ai-card__stat">${fakeInt(8, 30)}</div>
-    <div class="ai-card__stat-label">Placeholder</div>
+    <div class="ai-card__stat-label">Placeholder — wire up a parking category ID</div>
     <div class="ai-card__minimap"></div>
   `);
   createMiniMap(parkingCard.querySelector(".ai-card__minimap")!, x, y);
 
   const urgentCard = addCard("teal", "Urgent cares found", `
     <div class="ai-card__stat">${fakeInt(3, 20)}</div>
-    <div class="ai-card__stat-label">Placeholder</div>
+    <div class="ai-card__stat-label">Placeholder — wire up an urgent-care category ID</div>
     <div class="ai-card__minimap"></div>
   `);
   createMiniMap(urgentCard.querySelector(".ai-card__minimap")!, x, y);
 
-  const routeCard = addCard("teal", "Optimized weekend warrior", `
-    <div class="ai-card__row"><span>Distance</span><b>${(Math.random() * 3 + 1).toFixed(1)} miles</b></div>
-    <div class="ai-card__row"><span>Est. time</span><b>${fakeInt(10, 25)}m</b></div>
-    <div class="ai-card__minimap"></div>
-    <div class="ai-card__label" style="margin-top:8px">Placeholder route wire up the Network Analysis Route service</div>
-  `);
-  createMiniMap(routeCard.querySelector(".ai-card__minimap")!, x, y);
+  // Real routing card
+  const routeCard = addCard("teal", "Sample route", `<div class="ai-card__minimap"></div><div class="ai-card__label" id="route-info" style="margin-top:8px">—</div>`);
+  const routeMinimapDiv = routeCard.querySelector(".ai-card__minimap") as HTMLDivElement;
+  const routeInfoDiv = routeCard.querySelector("#route-info") as HTMLDivElement;
+
+  if (routeData && routeData.paths.length) {
+    const routeLayer = new GraphicsLayer();
+    routeLayer.add(new Graphic({
+      geometry: { type: "polyline", paths: routeData.paths, spatialReference: { wkid: 4326 } } as any,
+      symbol: { type: "simple-line", color: "#0f6e56", width: 3 } as any,
+    }));
+    routeLayer.add(pointGraphic(x, y));
+    routeLayer.add(pointGraphic(destination.x, destination.y, "#378add"));
+
+    const routeView = new MapView({
+      container: routeMinimapDiv,
+      map: new Map({ basemap: "arcgis/streets", layers: [routeLayer] }),
+      constraints: { rotationEnabled: false },
+      ui: { components: ["attribution"] },
+    });
+    miniViews.push(routeView);
+    await routeView.when();
+    await routeView.goTo(routeLayer.graphics.toArray(), { animate: false });
+
+    routeInfoDiv.innerHTML = `
+      ${routeData.distanceKm != null ? routeData.distanceKm.toFixed(1) + " km" : "—"} ·
+      ${routeData.minutes != null ? Math.round(routeData.minutes) + " min" : "—"}
+      <br><span style="color:#999">Sample destination — swap in a real one (e.g. a Places result) once Places is authorized.</span>
+    `;
+  } else {
+    routeInfoDiv.textContent = "Route unavailable — check the Routing privilege on your API key.";
+  }
 
   addCard("green", "Walkability", `
     <div class="ai-card__stat" style="font-size:20px">Fair</div>
     <div class="ai-card__row"><span>Slope</span><b>Fair</b></div>
     <div class="ai-card__row"><span>Distance</span><b>Fair</b></div>
     <div class="ai-card__row"><span>POI coverage</span><b>Fair</b></div>
-    <div class="ai-card__label" style="margin-top:8px">Placeholder</div>
+    <div class="ai-card__label" style="margin-top:8px">Placeholder — combine slope + POI coverage for a real score</div>
   `);
 
   addCard("green", "Marital status", fakeDonutLegend([
@@ -285,66 +371,44 @@ async function renderResults(root: HTMLDivElement, data: any) {
   addCard("pink", "I am careful with my money", fakeSurveyBar());
   addCard("pink", "Hate going to my bank", fakeSurveyBar());
 
-  const demoCard = addCard("teal", "Demographics analysis area", `<div class="ai-card__minimap"></div><div class="ai-card__label" style="margin-top:8px">1-mile buffer used for the enrichment call below</div>`);
+  const demoCard = addCard("teal", "Demographics analysis area", `<div class="ai-card__minimap"></div><div class="ai-card__label" style="margin-top:8px">1-mile buffer used for the enrichment cards below</div>`);
   createMiniMap(demoCard.querySelector(".ai-card__minimap")!, x, y, 1);
 
-  addCard("purple", "Dominant segment", `
-    <div style="font-weight:600">Sample segment — placeholder</div>
-    <div class="ai-card__stat-label">Tapestry data isn't available on Esri India accounts. Wire up a real segmentation source here if you have one, or remove this card.</div>
-  `);
+  addCard("purple", "Dominant segment", enrichment
+    ? buildDominantSegment(enrichment)
+    : `<div class="ai-card__stat-label">Unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`);
 
-  const popCard = addCard("teal", "Nearby population", enrichment != null
-    ? `<div class="ai-card__stat">${enrichment.TOTPOP ?? "—"}</div><div class="ai-card__stat-label">Total population, 1-mile buffer</div><div class="ai-card__minimap"></div>`
+  const popCard = addCard("teal", "Nearby population", enrichment
+    ? `
+      <div class="stat-grid">
+        <div><div class="ai-card__stat" style="font-size:20px">${formatInt(enrichment.TOTPOP_CY ?? 0)}</div><div class="ai-card__stat-label">Total</div></div>
+        <div><div class="ai-card__stat" style="font-size:20px">${formatInt(enrichment.MALES_CY ?? 0)}</div><div class="ai-card__stat-label">Male</div></div>
+        <div><div class="ai-card__stat" style="font-size:20px">${formatInt(enrichment.FEMALES_CY ?? 0)}</div><div class="ai-card__stat-label">Female</div></div>
+        <div><div class="ai-card__stat" style="font-size:20px">${enrichment.POPDENS_CY?.toFixed(0) ?? "—"}</div><div class="ai-card__stat-label">Per km²</div></div>
+      </div>
+      <div class="ai-card__minimap"></div>
+    `
     : `<div class="ai-card__stat-label">Unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`);
   const popMinimap = popCard.querySelector(".ai-card__minimap");
   if (popMinimap) createMiniMap(popMinimap as HTMLDivElement, x, y, 1);
 
-  // Spending cards
-  if (enrichment) {
-    const categories = parseSpendingCategories(enrichment);
-    const total = categories.find((c) => c.code === "CS01");
-    const rest = categories.filter((c) => c.code !== "CS01");
-    const maxIndex = Math.max(...rest.map((c) => c.index || 0), 1);
-    const sortedByIndex = [...rest].sort((a, b) => (b.index || 0) - (a.index || 0));
-
-    addCard("teal", "Total consumer spending", total
-      ? `<div class="ai-card__stat">${formatCompact(total.cy)}</div>
-         <div class="ai-card__stat-label">CS01, 1-mile buffer — currency units unconfirmed for this account</div>`
-      : `<div class="ai-card__stat-label">CS01 field not present in this account's response.</div>`);
-
-    addCard("teal", "Spending index by category", `
-      ${sortedByIndex.map((c) => `
-        <div class="spend-bar-row">
-          <span class="spend-bar-row__label">${c.code}</span>
-          <div class="spend-bar-row__track"><div class="spend-bar-row__fill" style="width:${((c.index || 0) / maxIndex) * 100}%"></div></div>
-          <span class="spend-bar-row__value">${c.index ?? "—"}</span>
-        </div>
-      `).join("")}
-      <div class="ai-card__label" style="margin-top:8px">Index vs. national average (100 = average). Field codes only — category names unconfirmed, check your Spending data dictionary.</div>
-    `);
-
-    addCard("teal", "Spending — full breakdown", `
-      <table>
-        <thead><tr><th>Field</th><th>CY value</th><th>Per capita</th><th>Index</th></tr></thead>
-        <tbody>
-          ${categories.map((c) => `<tr><td>${c.code}</td><td>${formatCompact(c.cy)}</td><td>${c.perCapita?.toFixed(2) ?? "—"}</td><td>${c.index ?? "—"}</td></tr>`).join("")}
-        </tbody>
-      </table>
-    `);
-  } else {
-    addCard("teal", "Consumer spending", `<div class="ai-card__stat-label">Unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`);
-  }
+  addCard("teal", "Purchasing power", enrichment
+    ? `
+      <div class="ai-card__stat">₹${formatCompact(enrichment.PP_CY ?? 0)}</div>
+      <div class="ai-card__stat-label">Total, 1-mile buffer (assumed INR — India-specific collection, verify against account docs)</div>
+      <div class="ai-card__row" style="margin-top:8px"><span>Per capita</span><b>₹${formatInt(enrichment.PPPC_CY ?? 0)}</b></div>
+      <div class="ai-card__row"><span>Index vs. national avg.</span><b>${enrichment.PPIDX_CY ?? "—"}</b></div>
+      <div class="ai-card__row"><span>Total consumer spending (CS01)</span><b>₹${formatCompact(enrichment.CS01_CY ?? 0)}</b></div>
+    `
+    : `<div class="ai-card__stat-label">Unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`);
 
   addCard("teal", "Mobile carrier share", fakeDonutLegend([
     ["Jio", "#0f6e56"], ["Airtel", "#5dcaa5"], ["Vi", "#b6771a"], ["BSNL", "#d85a30"],
   ]));
 
-  addCard("teal", "Population by age and sex", `
-    <div class="ai-card__label">Placeholder pyramid — wire up a real age/sex breakdown from GeoEnrichment</div>
-    <div class="fake-pyramid">
-      ${[0, 1, 2, 3, 4, 5].map(() => `<div class="fake-pyramid__row"><div class="fake-pyramid__bar" style="width:${fakeInt(20, 90)}%"></div><div class="fake-pyramid__bar fake-pyramid__bar--r" style="width:${fakeInt(20, 90)}%"></div></div>`).join("")}
-    </div>
-  `);
+  addCard("teal", "Population by age and sex", enrichment
+    ? buildAgePyramid(enrichment)
+    : `<div class="ai-card__stat-label">Unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`);
 
   addCard("teal", "Geocoding response", `<pre class="ai-card__json">${JSON.stringify(rawAttributes, null, 2)}</pre>`);
 }
