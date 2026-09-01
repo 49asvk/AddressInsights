@@ -1,0 +1,97 @@
+:root {
+  --ai-radius: 10px;
+  --ai-gap: 16px;
+  --ai-card-bg: #ffffff;
+  --ai-header-teal: #0f6e56;
+  --ai-header-amber: #b6771a;
+  --ai-header-purple: #6b4fbb;
+  --ai-header-green: #2f7d32;
+  --ai-header-pink: #99355a;
+}
+
+body { margin: 0; font-family: system-ui, sans-serif; background: #f4f3ef; }
+.app-shell { min-height: 100vh; }
+
+.search-bar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 20px; border-bottom: 1px solid #ddd; background: #fff;
+}
+
+.result-header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 16px 20px; background: #fff; border-bottom: 1px solid #ddd;
+}
+.logo-dots { display: grid; grid-template-columns: repeat(2, 6px); gap: 3px; }
+.logo-dots span { width: 6px; height: 6px; border-radius: 50%; }
+.logo-dots span:nth-child(1) { background: #0f6e56; }
+.logo-dots span:nth-child(2) { background: #b6771a; }
+.logo-dots span:nth-child(3) { background: #d85a30; }
+.logo-dots span:nth-child(4) { background: #378add; }
+.result-title { font-weight: 700; font-size: 15px; }
+.result-subtitle { font-size: 13px; color: #666; }
+
+/* Pinterest-style masonry: cards flow top-to-bottom per column, then wrap
+   to the next column, which is what gives the bento-grid look -- CSS
+   grid alone can't do variable-height cards without a JS layout pass. */
+.card-grid { columns: 280px 4; column-gap: var(--ai-gap); padding: var(--ai-gap); }
+
+.ai-card {
+  break-inside: avoid; margin-bottom: var(--ai-gap);
+  border-radius: var(--ai-radius); background: var(--ai-card-bg);
+  border: 1px solid #e2e2e2; overflow: hidden;
+  display: inline-block; width: 100%;
+}
+.ai-card--scene { padding: 0; }
+.ai-card__scene { height: 320px; width: 100%; }
+
+.ai-card__header { padding: 10px 14px; color: #fff; font-weight: 600; font-size: 14px; }
+.ai-card[data-kind="teal"] .ai-card__header { background: var(--ai-header-teal); }
+.ai-card[data-kind="amber"] .ai-card__header { background: var(--ai-header-amber); }
+.ai-card[data-kind="purple"] .ai-card__header { background: var(--ai-header-purple); }
+.ai-card[data-kind="green"] .ai-card__header { background: var(--ai-header-green); }
+.ai-card[data-kind="pink"] .ai-card__header { background: var(--ai-header-pink); }
+
+.ai-card__body { padding: 14px; font-size: 13px; color: #333; }
+.ai-card__stat { font-size: 28px; font-weight: 700; margin-top: 4px; }
+.ai-card__stat-label, .ai-card__label { font-size: 12px; color: #666; }
+.ai-card__row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #f0f0f0; }
+
+.ai-card__json {
+  font-family: monospace; font-size: 11px; max-height: 220px; overflow: auto;
+  background: #f7f7f5; padding: 8px; border-radius: 6px;
+  white-space: pre-wrap; word-break: break-all;
+}
+
+/* .map-preview {
+  margin-top: 10px; height: 140px; border-radius: 6px; position: relative;
+  background:
+    linear-gradient(#eee 1px, transparent 1px) 0 0 / 20px 20px,
+    linear-gradient(90deg, #eee 1px, transparent 1px) 0 0 / 20px 20px,
+    #f7f7f5;
+}
+.map-preview__pin {
+  position: absolute; top: 50%; left: 50%; width: 10px; height: 10px;
+  border-radius: 50% 50% 50% 0; background: #d85a30;
+  transform: translate(-50%, -100%) rotate(-45deg);
+} */
+.ai-card__minimap { margin-top: 10px; height: 150px; border-radius: 6px; overflow: hidden; }
+
+.survey-bar { display: flex; height: 18px; border-radius: 4px; overflow: hidden; }
+
+.fake-legend__row { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
+.fake-legend__swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+.fake-pyramid__row { display: flex; align-items: center; height: 14px; margin: 3px 0; }
+.fake-pyramid__bar { height: 10px; background: #378add; }
+.fake-pyramid__bar--r { background: #d85a30; }
+
+.ai-card table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.ai-card table th, .ai-card table td { text-align: right; padding: 4px 6px; border-bottom: 1px solid #f0f0f0; }
+.ai-card table th:first-child, .ai-card table td:first-child { text-align: left; }
+.ai-card table tbody tr:nth-child(even) { background: #f9f9f7; }
+
+.spend-bar-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.spend-bar-row__label { width: 46px; font-size: 12px; color: #666; flex-shrink: 0; }
+.spend-bar-row__track { flex: 1; height: 10px; background: #eee; border-radius: 4px; overflow: hidden; }
+.spend-bar-row__fill { height: 100%; background: #0f6e56; }
+.spend-bar-row__value { width: 46px; font-size: 12px; text-align: right; flex-shrink: 0; }
