@@ -14,8 +14,6 @@ const travelModeCache = new Map<TravelModeName, any>();
 
 async function getTravelMode(name: TravelModeName) {
   if (travelModeCache.has(name)) return travelModeCache.get(name);
-  // Relies on the global esriConfig.apiKey set in main.ts -- if this call
-  // 403s while everything else works, that's the first thing to check.
   const description = await networkService.fetchServiceDescription(SERVICE_AREA_URL);
   const mode = description.supportedTravelModes.find((m: any) => m.name === name);
   if (!mode) throw new Error(`Travel mode "${name}" not found in this service's supported modes.`);
@@ -44,16 +42,18 @@ export async function solveServiceAreaCatchment(
     facilities: new FeatureSet({ features: [facility] }),
     defaultBreaks: [km],
     travelMode,
-    // Area reachable FROM the address, not routes converging on it --
-    // "to-facility" (used in Esri's own sample) is for the opposite
-    // scenario, e.g. customers reaching a store.
     travelDirection: "from-facility",
     outSpatialReference: { wkid: 4326 } as any,
     trimOuterPolygon: true,
   } as any);
 
   const result = await serviceArea.solve(SERVICE_AREA_URL, params);
-  const polygonGraphic = result.serviceAreaPolygons?.[0];
+
+  // serviceAreaPolygons is a FeatureSet, not a plain array -- its
+  // polygons live under .features. Indexing it directly (the bug that
+  // shipped last time) always returned undefined and silently triggered
+  // the ring-buffer fallback on every search.
+  const polygonGraphic = result.serviceAreaPolygons?.features?.[0];
   const geometry = polygonGraphic?.geometry as __esri.Polygon | undefined;
   if (!geometry?.rings) return null;
 

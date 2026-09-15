@@ -13,7 +13,7 @@ import { solveRoute, type RouteResult } from "./services/routing";
 import { fetchPoiCategories, queryNearbyPois, type PoiResult } from "./services/poi";
 import { solveServiceAreaCatchment, type TravelModeName } from "./services/serviceArea";
 import type { Catchment } from "./services/catchment";
-import { ENRICHMENT_COLLECTIONS } from "./data/enrichmentVariables";
+import { ENRICHMENT_COLLECTIONS, type EnrichmentCollection } from "./data/enrichmentVariables";
 
 let currentSceneView: SceneView | null = null;
 let miniViews: MapView[] = [];
@@ -68,10 +68,10 @@ async function resolveCatchment(x: number, y: number, selection: CatchmentSelect
   try {
     const result = await solveServiceAreaCatchment(x, y, selection.mode, selection.km);
     if (result) return { kind: "polygon", rings: result.rings };
+    console.warn("Service area solve returned no polygon -- falling back to a ring buffer.");
   } catch (err) {
     console.error("Service area solve failed -- check the Routing privilege on your API key:", err);
   }
-  console.warn("Falling back to a simple ring buffer for the catchment.");
   return { kind: "ring", km: selection.km };
 }
 
@@ -181,7 +181,7 @@ export function renderApp(root: HTMLElement) {
   });
 }
 
-const CACHE_VERSION = "v6";
+const CACHE_VERSION = "v7";
 
 async function runSearch(
   addressText: string,
@@ -259,7 +259,6 @@ async function runSearch(
       routeDestY = nearest.y;
       destLabel = `${nearest.name} (${nearest.category})`;
     }
-    console.log(`[route] destination chosen: ${destLabel} at (${routeDestX}, ${routeDestY})`);
 
     const routeResult = await solveRoute(geocoded.location.x, geocoded.location.y, routeDestX, routeDestY).catch((err) => {
       console.error("Routing failed:", err);
@@ -308,6 +307,11 @@ function formatInt(n: number) {
   return new Intl.NumberFormat().format(Math.round(n));
 }
 
+function formatFieldValue(raw: any, unit?: "currency") {
+  if (typeof raw !== "number") return raw ?? "—";
+  return unit === "currency" ? `₹${formatCompact(raw)}` : formatCompact(raw);
+}
+
 function pointGraphic(x: number, y: number, color = "#d85a30") {
   return new Graphic({
     geometry: { type: "point", x, y, spatialReference: { wkid: 4326 } } as any,
@@ -330,10 +334,6 @@ function catchmentGraphic(x: number, y: number, catchment: Catchment) {
   });
 }
 
-// Awaited by every caller -- constructing several MapViews' WebGL
-// contexts in the same synchronous tick (no awaiting between them) has
-// already caused silently-blank maps once in this build; this stays
-// sequential on purpose.
 async function createMiniMap(container: HTMLDivElement, x: number, y: number, catchment?: Catchment) {
   const layer = new GraphicsLayer();
   if (catchment) layer.add(catchmentGraphic(x, y, catchment));
@@ -372,58 +372,48 @@ async function createPoiMiniMap(container: HTMLDivElement, x: number, y: number,
 }
 
 // --- Enrichment card builders -------------------------------------------
+// One card per data collection. Population, Age, and Consumer Styles get
+// a dedicated chart/visual; every other collection uses a generic
+// hero-stat-plus-rows layout. Special-cased collections still show ANY
+// other selected field from that same collection as extra rows -- an
+// earlier version silently dropped fields outside its hand-picked set.
 
-const consumerStylesLabels = Object.fromEntries(
-  (ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "ConsumerStylesEsriIndia")?.variables ?? []).map((v) => [v.id, v.label])
-);
+const populationCollection = ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "PopulationEsriIndia")!;
+const ageIncrementsCollection = ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "15YearIncrementsEsriIndia")!;
+const consumerStylesCollection = ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "ConsumerStylesEsriIndia")!;
+const consumerStylesLabels = Object.fromEntries(consumerStylesCollection.variables.map((v) => [v.id, v.label]));
 
-const CURATED_FIELDS = new Set([
-  "TOTPOP_CY", "MALES_CY", "FEMALES_CY", "POPDENS_CY",
-  "PP_CY", "PPPC_CY", "PPIDX_CY",
-  "MAGE01_CY", "MAGE02_CY", "MAGE03_CY", "MAGE04_CY", "MAGE05_CY",
-  "FAGE01_CY", "FAGE02_CY", "FAGE03_CY", "FAGE04_CY", "FAGE05_CY",
+const SPECIAL_CASED_COLLECTIONS = new Set([
+  populationCollection.collectionId,
+  ageIncrementsCollection.collectionId,
+  consumerStylesCollection.collectionId,
 ]);
-
-const ALL_VARIABLE_UNITS: Record<string, "currency" | undefined> = Object.fromEntries(
-  ENRICHMENT_COLLECTIONS.flatMap((c) => c.variables.map((v) => [v.id, v.unit]))
-);
-
-const META_FIELDS = new Set([
-  "OBJECTID", "ID", "HasData", "aggregationMethod", "sourceCountry",
-  "ID_0", "id", "areaType", "bufferUnits", "bufferUnitsAlias", "bufferRadii",
-  "populationToPolygonSizeRating", "apportionmentConfidence",
-]);
-
-const ALL_VARIABLE_LABELS: Record<string, string> = Object.fromEntries(
-  ENRICHMENT_COLLECTIONS.flatMap((c) => c.variables.map((v) => [v.id, v.label]))
-);
 
 function buildNearbyPopulation(enrichment: Record<string, any>): string | null {
+  const curatedIds = ["TOTPOP_CY", "MALES_CY", "FEMALES_CY", "POPDENS_CY"];
   const stats: { label: string; value: string }[] = [];
   if ("TOTPOP_CY" in enrichment) stats.push({ label: "Total", value: formatInt(enrichment.TOTPOP_CY) });
   if ("MALES_CY" in enrichment) stats.push({ label: "Male", value: formatInt(enrichment.MALES_CY) });
   if ("FEMALES_CY" in enrichment) stats.push({ label: "Female", value: formatInt(enrichment.FEMALES_CY) });
   if ("POPDENS_CY" in enrichment) stats.push({ label: "Per km²", value: Number(enrichment.POPDENS_CY).toFixed(0) });
-  if (stats.length === 0) return null;
-  return `
-    <div class="stat-grid">
-      ${stats.map((s) => `<div><div class="ai-card__stat" style="font-size:20px">${s.value}</div><div class="ai-card__stat-label">${s.label}</div></div>`).join("")}
-    </div>
-    <div class="ai-card__minimap"></div>
-  `;
-}
 
-function buildPurchasingPower(enrichment: Record<string, any>): string | null {
-  let hero = "";
-  const rows: string[] = [];
-  if ("PP_CY" in enrichment) hero = `<div class="ai-card__stat">₹${formatCompact(enrichment.PP_CY)}</div><div class="ai-card__stat-label">Total, selected catchment (assumed INR — verify against account docs)</div>`;
-  if ("PPPC_CY" in enrichment) rows.push(`<div class="ai-card__row"><span>Per capita</span><b>₹${formatInt(enrichment.PPPC_CY)}</b></div>`);
-  if ("PPIDX_CY" in enrichment) rows.push(`<div class="ai-card__row"><span>Index vs. national avg.</span><b>${enrichment.PPIDX_CY}</b></div>`);
-  if (!hero && rows.length === 0) return null;
-  return `${hero}${rows.join("")}`;
+  const extraRows = populationCollection.variables
+    .filter((v) => !curatedIds.includes(v.id) && v.id in enrichment)
+    .map((v) => `<div class="ai-card__row"><span>${v.label}</span><b>${formatFieldValue(enrichment[v.id], v.unit)}</b></div>`)
+    .join("");
+
+  if (stats.length === 0 && !extraRows) return null;
+
+  const gridHtml = stats.length
+    ? `<div class="stat-grid">${stats.map((s) => `<div><div class="ai-card__stat" style="font-size:20px">${s.value}</div><div class="ai-card__stat-label">${s.label}</div></div>`).join("")}</div>`
+    : "";
+
+  return `${gridHtml}${extraRows}<div class="ai-card__minimap"></div>`;
 }
 
 function buildAgePyramid(enrichment: Record<string, any>): string | null {
+  const coveredIds = new Set(["MAGE01_CY", "MAGE02_CY", "MAGE03_CY", "MAGE04_CY", "MAGE05_CY", "FAGE01_CY", "FAGE02_CY", "FAGE03_CY", "FAGE04_CY", "FAGE05_CY"]);
+
   const brackets = [
     { label: "60+", mKey: "MAGE05_CY", fKey: "FAGE05_CY" },
     { label: "45–59", mKey: "MAGE04_CY", fKey: "FAGE04_CY" },
@@ -433,18 +423,28 @@ function buildAgePyramid(enrichment: Record<string, any>): string | null {
   ]
     .map((b) => ({ label: b.label, m: enrichment[b.mKey] || 0, f: enrichment[b.fKey] || 0, present: b.mKey in enrichment || b.fKey in enrichment }))
     .filter((b) => b.present);
-  if (brackets.length === 0) return null;
-  const max = Math.max(...brackets.flatMap((b) => [b.m, b.f]), 1);
-  return `
-    <div class="pyramid-legend"><span class="pyramid-swatch pyramid-swatch--m"></span>Male<span class="pyramid-swatch pyramid-swatch--f" style="margin-left:14px"></span>Female</div>
-    ${brackets.map((b) => `
-      <div class="pyramid-row">
-        <div class="pyramid-row__side pyramid-row__side--m"><div class="pyramid-row__fill pyramid-row__fill--m" style="width:${(b.m / max) * 100}%"></div></div>
-        <div class="pyramid-row__label">${b.label}</div>
-        <div class="pyramid-row__side pyramid-row__side--f"><div class="pyramid-row__fill pyramid-row__fill--f" style="width:${(b.f / max) * 100}%"></div></div>
-      </div>
-    `).join("")}
-  `;
+
+  const pyramidHtml = brackets.length === 0 ? "" : (() => {
+    const max = Math.max(...brackets.flatMap((b) => [b.m, b.f]), 1);
+    return `
+      <div class="pyramid-legend"><span class="pyramid-swatch pyramid-swatch--m"></span>Male<span class="pyramid-swatch pyramid-swatch--f" style="margin-left:14px"></span>Female</div>
+      ${brackets.map((b) => `
+        <div class="pyramid-row">
+          <div class="pyramid-row__side pyramid-row__side--m"><div class="pyramid-row__fill pyramid-row__fill--m" style="width:${(b.m / max) * 100}%"></div></div>
+          <div class="pyramid-row__label">${b.label}</div>
+          <div class="pyramid-row__side pyramid-row__side--f"><div class="pyramid-row__fill pyramid-row__fill--f" style="width:${(b.f / max) * 100}%"></div></div>
+        </div>
+      `).join("")}
+    `;
+  })();
+
+  const extraRows = ageIncrementsCollection.variables
+    .filter((v) => !coveredIds.has(v.id) && v.id in enrichment)
+    .map((v) => `<div class="ai-card__row"><span>${v.label}</span><b>${formatFieldValue(enrichment[v.id], v.unit)}</b></div>`)
+    .join("");
+
+  if (!pyramidHtml && !extraRows) return null;
+  return `${pyramidHtml}${extraRows}`;
 }
 
 const DONUT_COLORS = ["#0f6e56", "#5dcaa5", "#378add", "#b6771a", "#d85a30", "#6b4fbb", "#99355a", "#2f7d32", "#26215c", "#7f77dd"];
@@ -475,16 +475,23 @@ function buildConsumerStylesDonut(enrichment: Record<string, any>): string | nul
   `;
 }
 
-function buildLeftoverStatCards(enrichment: Record<string, any>): { title: string; body: string }[] {
-  const consumerStyleKeys = new Set(Object.keys(consumerStylesLabels));
-  return Object.keys(enrichment)
-    .filter((k) => !CURATED_FIELDS.has(k) && !META_FIELDS.has(k) && !consumerStyleKeys.has(k))
-    .map((k) => {
-      const raw = enrichment[k];
-      const isCurrency = ALL_VARIABLE_UNITS[k] === "currency";
-      const value = typeof raw === "number" ? (isCurrency ? `₹${formatCompact(raw)}` : formatCompact(raw)) : raw;
-      return { title: ALL_VARIABLE_LABELS[k] ?? k, body: `<div class="ai-card__stat">${value}</div>` };
-    });
+function buildGenericCollectionCard(
+  collection: EnrichmentCollection,
+  enrichment: Record<string, any>
+): { title: string; body: string } | null {
+  const present = collection.variables.filter((v) => v.id in enrichment);
+  if (present.length === 0) return null;
+
+  const [hero, ...rest] = present;
+  const heroHtml = `
+    <div class="ai-card__stat">${formatFieldValue(enrichment[hero.id], hero.unit)}</div>
+    <div class="ai-card__stat-label">${hero.label}</div>
+  `;
+  const restHtml = rest
+    .map((v) => `<div class="ai-card__row"><span>${v.label}</span><b>${formatFieldValue(enrichment[v.id], v.unit)}</b></div>`)
+    .join("");
+
+  return { title: collection.label, body: heroHtml + restHtml };
 }
 
 // -------------------------------------------------------------------------
@@ -603,21 +610,28 @@ async function renderResults(root: HTMLDivElement, data: any) {
   const demoCard = addCard("teal", "Demographics analysis area", `<div class="ai-card__minimap"></div><div class="ai-card__label" style="margin-top:8px">${catchmentLabel}, used for the enrichment cards below</div>`);
   await createMiniMap(demoCard.querySelector(".ai-card__minimap")!, x, y, catchment);
 
-  const popHtml = enrichment ? buildNearbyPopulation(enrichment) : null;
-  const popCard = addCard("teal", "Nearby population", popHtml ?? `<div class="ai-card__stat-label">No population variables selected, or unavailable — check the Demographics privilege.</div>`);
-  const popMinimap = popCard.querySelector(".ai-card__minimap");
-  if (popMinimap) await createMiniMap(popMinimap as HTMLDivElement, x, y, catchment);
-
-  const ppHtml = enrichment ? buildPurchasingPower(enrichment) : null;
-  addCard("teal", "Purchasing power", ppHtml ?? `<div class="ai-card__stat-label">No purchasing power / spending variables selected, or unavailable.</div>`);
-
-  const pyramidHtml = enrichment ? buildAgePyramid(enrichment) : null;
-  addCard("teal", "Population by age and sex", pyramidHtml ?? `<div class="ai-card__stat-label">No age-bracket variables selected, or unavailable.</div>`);
-
   if (enrichment) {
+    const popHtml = buildNearbyPopulation(enrichment);
+    if (popHtml) {
+      const popCard = addCard("teal", "Population", popHtml);
+      const popMinimap = popCard.querySelector(".ai-card__minimap");
+      if (popMinimap) await createMiniMap(popMinimap as HTMLDivElement, x, y, catchment);
+    }
+
+    const pyramidHtml = buildAgePyramid(enrichment);
+    if (pyramidHtml) addCard("teal", "Population by Age and Sex", pyramidHtml);
+
     const donutHtml = buildConsumerStylesDonut(enrichment);
-    if (donutHtml) addCard("purple", "Consumer Styles breakdown", donutHtml);
-    buildLeftoverStatCards(enrichment).forEach(({ title, body }) => addCard("teal", title, body));
+    if (donutHtml) addCard("purple", "Consumer Styles", donutHtml);
+
+    ENRICHMENT_COLLECTIONS
+      .filter((c) => !SPECIAL_CASED_COLLECTIONS.has(c.collectionId))
+      .forEach((c) => {
+        const card = buildGenericCollectionCard(c, enrichment);
+        if (card) addCard("teal", card.title, card.body);
+      });
+  } else {
+    addCard("teal", "Demographics", `<div class="ai-card__stat-label">No variables selected, or unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`);
   }
 
   addCard("teal", "Geocoding response", `<pre class="ai-card__json">${JSON.stringify(rawAttributes, null, 2)}</pre>`);
