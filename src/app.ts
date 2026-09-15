@@ -11,6 +11,8 @@ import { enrichPoint } from "./services/geoenrichment";
 import { sampleElevation } from "./services/elevation";
 import { solveRoute, type RouteResult } from "./services/routing";
 import { fetchPoiCategories, queryNearbyPois, type PoiResult } from "./services/poi";
+import { solveServiceAreaCatchment, type TravelModeName } from "./services/serviceArea";
+import type { Catchment } from "./services/catchment";
 import { ENRICHMENT_COLLECTIONS } from "./data/enrichmentVariables";
 
 let currentSceneView: SceneView | null = null;
@@ -22,6 +24,61 @@ function destroyAllViews() {
   currentSceneView = null;
   miniViews.forEach((v) => v.destroy());
   miniViews = [];
+}
+
+// --- Pickers --------------------------------------------------------
+
+function buildCatchmentPanel(): string {
+  return `
+    <calcite-block heading="Catchment area" description="Defines the area used for enrichment and nearby-place searches" collapsible open>
+      <div class="catchment-row">
+        <label><input type="radio" name="catchment-type" value="ring" checked> Simple buffer</label>
+        <label><input type="radio" name="catchment-type" value="service-area"> Service area (street network)</label>
+      </div>
+      <div class="catchment-row">
+        <span class="catchment-row__label">Distance:</span>
+        <label><input type="radio" name="catchment-km" value="1" checked> 1 km</label>
+        <label><input type="radio" name="catchment-km" value="3"> 3 km</label>
+        <label><input type="radio" name="catchment-km" value="5"> 5 km</label>
+      </div>
+      <div class="catchment-row" id="catchment-mode-row" style="display:none">
+        <span class="catchment-row__label">Mode:</span>
+        <label><input type="radio" name="catchment-mode" value="Walking Distance" checked> Walking</label>
+        <label><input type="radio" name="catchment-mode" value="Driving Distance"> Driving</label>
+      </div>
+    </calcite-block>
+  `;
+}
+
+interface CatchmentSelection {
+  type: "ring" | "service-area";
+  km: number;
+  mode: TravelModeName;
+}
+
+function getCatchmentSelection(root: HTMLElement): CatchmentSelection {
+  const type = ((root.querySelector('input[name="catchment-type"]:checked') as HTMLInputElement)?.value ?? "ring") as "ring" | "service-area";
+  const km = Number((root.querySelector('input[name="catchment-km"]:checked') as HTMLInputElement)?.value ?? "1");
+  const mode = ((root.querySelector('input[name="catchment-mode"]:checked') as HTMLInputElement)?.value ?? "Walking Distance") as TravelModeName;
+  return { type, km, mode };
+}
+
+async function resolveCatchment(x: number, y: number, selection: CatchmentSelection): Promise<Catchment> {
+  if (selection.type === "ring") return { kind: "ring", km: selection.km };
+  try {
+    const result = await solveServiceAreaCatchment(x, y, selection.mode, selection.km);
+    if (result) return { kind: "polygon", rings: result.rings };
+  } catch (err) {
+    console.error("Service area solve failed -- check the Routing privilege on your API key:", err);
+  }
+  console.warn("Falling back to a simple ring buffer for the catchment.");
+  return { kind: "ring", km: selection.km };
+}
+
+function catchmentLabelFor(selection: CatchmentSelection): string {
+  return selection.type === "ring"
+    ? `${selection.km} km buffer`
+    : `${selection.km} km ${selection.mode.replace(" Distance", "").toLowerCase()} service area`;
 }
 
 function buildVariablePanel(): string {
@@ -77,6 +134,8 @@ function getSelectedPoiCategories(root: HTMLElement): string[] {
     .map((cb) => poiCategoryList[Number(cb.dataset.index)]);
 }
 
+// --- App shell --------------------------------------------------------
+
 export function renderApp(root: HTMLElement) {
   root.innerHTML = `
     <div class="app-shell">
@@ -84,7 +143,10 @@ export function renderApp(root: HTMLElement) {
         <calcite-input id="address-input" placeholder="Enter an address" style="width: 420px"></calcite-input>
         <calcite-button id="search-btn">Search</calcite-button>
       </div>
-      <div class="var-picker">${buildVariablePanel()}</div>
+      <div class="var-picker">
+        ${buildCatchmentPanel()}
+        ${buildVariablePanel()}
+      </div>
       <div class="poi-picker"></div>
       <div id="results"></div>
     </div>
@@ -93,6 +155,14 @@ export function renderApp(root: HTMLElement) {
   const input = root.querySelector("#address-input") as any;
   const button = root.querySelector("#search-btn") as HTMLElement;
   const results = root.querySelector("#results") as HTMLDivElement;
+
+  root.querySelectorAll('input[name="catchment-type"]').forEach((el) =>
+    el.addEventListener("change", () => {
+      const modeRow = root.querySelector("#catchment-mode-row") as HTMLElement;
+      const type = (root.querySelector('input[name="catchment-type"]:checked') as HTMLInputElement)?.value;
+      modeRow.style.display = type === "service-area" ? "" : "none";
+    })
+  );
 
   root.querySelector("#select-all-vars")?.addEventListener("click", () => {
     root.querySelectorAll<any>(".var-checkbox").forEach((cb) => (cb.checked = true));
@@ -106,21 +176,23 @@ export function renderApp(root: HTMLElement) {
   button.addEventListener("click", () => {
     const variableKeys = getSelectedVariableKeys(root);
     const poiCategories = getSelectedPoiCategories(root);
-    runSearch(input.value, results, variableKeys, poiCategories);
+    const catchmentSelection = getCatchmentSelection(root);
+    runSearch(input.value, results, variableKeys, poiCategories, catchmentSelection);
   });
 }
 
-const CACHE_VERSION = "v5";
+const CACHE_VERSION = "v6";
 
 async function runSearch(
   addressText: string,
   results: HTMLDivElement,
   variableKeys: string[],
-  poiCategories: string[]
+  poiCategories: string[],
+  catchmentSelection: CatchmentSelection
 ) {
   if (!addressText) return;
 
-  const signature = `${[...variableKeys].sort().join(",")}|${[...poiCategories].sort().join(",")}`;
+  const signature = `${[...variableKeys].sort().join(",")}|${[...poiCategories].sort().join(",")}|${catchmentSelection.type}:${catchmentSelection.km}:${catchmentSelection.mode}`;
   const cacheKey = `address-insights:${CACHE_VERSION}:${addressText.toLowerCase().trim()}:${signature}`;
   const cached = sessionStorage.getItem(cacheKey);
 
@@ -143,13 +215,19 @@ async function runSearch(
       return;
     }
 
+    const catchment = await resolveCatchment(geocoded.location.x, geocoded.location.y, catchmentSelection);
+    const catchmentLabel = catchmentLabelFor(catchmentSelection);
+
+    const destX = geocoded.location.x + 0.02;
+    const destY = geocoded.location.y + 0.015;
+
     const [otherResults, poiSettled] = await Promise.all([
       Promise.allSettled([
         sampleElevation(geocoded.location.x, geocoded.location.y),
         sampleElevationRing(geocoded.location.x, geocoded.location.y),
-        enrichPoint(geocoded.location.x, geocoded.location.y, variableKeys),
+        enrichPoint(geocoded.location.x, geocoded.location.y, variableKeys, catchment),
       ]),
-      Promise.allSettled(poiCategories.map((cat) => queryNearbyPois(geocoded.location.x, geocoded.location.y, cat))),
+      Promise.allSettled(poiCategories.map((cat) => queryNearbyPois(geocoded.location.x, geocoded.location.y, cat, catchment))),
     ]);
 
     const [elevationResult, ringResult, enrichmentResult] = otherResults;
@@ -166,11 +244,9 @@ async function runSearch(
       }
     });
 
-    // Route target: nearest POI across every selected category. Falls
-    // back to a sample offset point if nothing was selected or found.
     const allPois = Object.values(poiByCategory).flat();
-    let destX = geocoded.location.x + 0.02;
-    let destY = geocoded.location.y + 0.015;
+    let routeDestX = destX;
+    let routeDestY = destY;
     let destLabel = "Sample destination (no POI selected/found)";
 
     if (allPois.length > 0) {
@@ -179,12 +255,13 @@ async function runSearch(
         const bd = (best.x - geocoded.location.x) ** 2 + (best.y - geocoded.location.y) ** 2;
         return d < bd ? p : best;
       });
-      destX = nearest.x;
-      destY = nearest.y;
+      routeDestX = nearest.x;
+      routeDestY = nearest.y;
       destLabel = `${nearest.name} (${nearest.category})`;
     }
-    console.log(`[route] destination chosen: ${destLabel} at (${destX}, ${destY})`);
-    const routeResult = await solveRoute(geocoded.location.x, geocoded.location.y, destX, destY).catch((err) => {
+    console.log(`[route] destination chosen: ${destLabel} at (${routeDestX}, ${routeDestY})`);
+
+    const routeResult = await solveRoute(geocoded.location.x, geocoded.location.y, routeDestX, routeDestY).catch((err) => {
       console.error("Routing failed:", err);
       return null;
     });
@@ -199,7 +276,9 @@ async function runSearch(
       enrichment: enrichmentResult.status === "fulfilled" ? enrichmentResult.value : null,
       poiByCategory,
       route: routeResult,
-      destination: { x: destX, y: destY, label: destLabel },
+      destination: { x: routeDestX, y: routeDestY, label: destLabel },
+      catchment,
+      catchmentLabel,
     };
 
     sessionStorage.setItem(cacheKey, JSON.stringify(bundle));
@@ -236,39 +315,29 @@ function pointGraphic(x: number, y: number, color = "#d85a30") {
   });
 }
 
-function bufferGraphic(x: number, y: number, miles: number) {
-  const circle = new Circle({
-    center: { x, y, spatialReference: { wkid: 4326 } } as any,
-    radius: miles,
-    radiusUnit: "miles",
-  });
+function catchmentGraphic(x: number, y: number, catchment: Catchment) {
+  if (catchment.kind === "ring") {
+    const circle = new Circle({
+      center: { x, y, spatialReference: { wkid: 4326 } } as any,
+      radius: catchment.km,
+      radiusUnit: "kilometers",
+    });
+    return new Graphic({ geometry: circle, symbol: { type: "simple-fill", color: [15, 110, 86, 0.15], outline: { color: "#0f6e56", width: 1.5 } } as any });
+  }
   return new Graphic({
-    geometry: circle,
+    geometry: { type: "polygon", rings: catchment.rings, spatialReference: { wkid: 4326 } } as any,
     symbol: { type: "simple-fill", color: [15, 110, 86, 0.15], outline: { color: "#0f6e56", width: 1.5 } } as any,
   });
 }
 
-function createMiniMap(container: HTMLDivElement, x: number, y: number, bufferMiles?: number) {
+// Awaited by every caller -- constructing several MapViews' WebGL
+// contexts in the same synchronous tick (no awaiting between them) has
+// already caused silently-blank maps once in this build; this stays
+// sequential on purpose.
+async function createMiniMap(container: HTMLDivElement, x: number, y: number, catchment?: Catchment) {
   const layer = new GraphicsLayer();
-  if (bufferMiles) layer.add(bufferGraphic(x, y, bufferMiles));
+  if (catchment) layer.add(catchmentGraphic(x, y, catchment));
   layer.add(pointGraphic(x, y));
-
-  const view = new MapView({
-    container,
-    map: new Map({ basemap: "arcgis/streets", layers: [layer] }),
-    center: [x, y],
-    zoom: bufferMiles ? 13 : 15,
-    constraints: { rotationEnabled: false },
-    ui: { components: ["attribution"] },
-  });
-  miniViews.push(view);
-  return view;
-}
-
-function createPoiMiniMap(container: HTMLDivElement, x: number, y: number, pois: { x: number; y: number }[]) {
-  const layer = new GraphicsLayer();
-  layer.add(pointGraphic(x, y, "#0f6e56"));
-  pois.forEach((p) => layer.add(pointGraphic(p.x, p.y, "#378add")));
 
   const view = new MapView({
     container,
@@ -279,31 +348,55 @@ function createPoiMiniMap(container: HTMLDivElement, x: number, y: number, pois:
     ui: { components: ["attribution"] },
   });
   miniViews.push(view);
+  await view.when();
+  if (catchment) await view.goTo(layer.graphics.toArray(), { animate: false });
+  return view;
+}
+
+async function createPoiMiniMap(container: HTMLDivElement, x: number, y: number, pois: { x: number; y: number }[], catchment: Catchment) {
+  const layer = new GraphicsLayer();
+  layer.add(catchmentGraphic(x, y, catchment));
+  layer.add(pointGraphic(x, y, "#0f6e56"));
+  pois.forEach((p) => layer.add(pointGraphic(p.x, p.y, "#378add")));
+
+  const view = new MapView({
+    container,
+    map: new Map({ basemap: "arcgis/streets", layers: [layer] }),
+    constraints: { rotationEnabled: false },
+    ui: { components: ["attribution"] },
+  });
+  miniViews.push(view);
+  await view.when();
+  await view.goTo(layer.graphics.toArray(), { animate: false });
   return view;
 }
 
 // --- Enrichment card builders -------------------------------------------
-// Each checks field presence in the response, not a separately-tracked
-// selection -- unselected fields simply never come back.
 
-const ALL_VARIABLE_LABELS: Record<string, string> = Object.fromEntries(
-  ENRICHMENT_COLLECTIONS.flatMap((c) => c.variables.map((v) => [v.id, v.label]))
+const consumerStylesLabels = Object.fromEntries(
+  (ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "ConsumerStylesEsriIndia")?.variables ?? []).map((v) => [v.id, v.label])
 );
 
 const CURATED_FIELDS = new Set([
   "TOTPOP_CY", "MALES_CY", "FEMALES_CY", "POPDENS_CY",
-  "PP_CY", "PPPC_CY", "PPIDX_CY", "CS01_CY",
+  "PP_CY", "PPPC_CY", "PPIDX_CY",
   "MAGE01_CY", "MAGE02_CY", "MAGE03_CY", "MAGE04_CY", "MAGE05_CY",
   "FAGE01_CY", "FAGE02_CY", "FAGE03_CY", "FAGE04_CY", "FAGE05_CY",
 ]);
 
-// Boilerplate fields the enrich response always includes regardless of
-// requested variables -- excluded from the "additional data" catch-all.
+const ALL_VARIABLE_UNITS: Record<string, "currency" | undefined> = Object.fromEntries(
+  ENRICHMENT_COLLECTIONS.flatMap((c) => c.variables.map((v) => [v.id, v.unit]))
+);
+
 const META_FIELDS = new Set([
   "OBJECTID", "ID", "HasData", "aggregationMethod", "sourceCountry",
   "ID_0", "id", "areaType", "bufferUnits", "bufferUnitsAlias", "bufferRadii",
   "populationToPolygonSizeRating", "apportionmentConfidence",
 ]);
+
+const ALL_VARIABLE_LABELS: Record<string, string> = Object.fromEntries(
+  ENRICHMENT_COLLECTIONS.flatMap((c) => c.variables.map((v) => [v.id, v.label]))
+);
 
 function buildNearbyPopulation(enrichment: Record<string, any>): string | null {
   const stats: { label: string; value: string }[] = [];
@@ -323,10 +416,9 @@ function buildNearbyPopulation(enrichment: Record<string, any>): string | null {
 function buildPurchasingPower(enrichment: Record<string, any>): string | null {
   let hero = "";
   const rows: string[] = [];
-  if ("PP_CY" in enrichment) hero = `<div class="ai-card__stat">₹${formatCompact(enrichment.PP_CY)}</div><div class="ai-card__stat-label">Total, 1-mile buffer (assumed INR — verify against account docs)</div>`;
+  if ("PP_CY" in enrichment) hero = `<div class="ai-card__stat">₹${formatCompact(enrichment.PP_CY)}</div><div class="ai-card__stat-label">Total, selected catchment (assumed INR — verify against account docs)</div>`;
   if ("PPPC_CY" in enrichment) rows.push(`<div class="ai-card__row"><span>Per capita</span><b>₹${formatInt(enrichment.PPPC_CY)}</b></div>`);
   if ("PPIDX_CY" in enrichment) rows.push(`<div class="ai-card__row"><span>Index vs. national avg.</span><b>${enrichment.PPIDX_CY}</b></div>`);
-  if ("CS01_CY" in enrichment) rows.push(`<div class="ai-card__row"><span>Total consumer spending</span><b>₹${formatCompact(enrichment.CS01_CY)}</b></div>`);
   if (!hero && rows.length === 0) return null;
   return `${hero}${rows.join("")}`;
 }
@@ -355,17 +447,44 @@ function buildAgePyramid(enrichment: Record<string, any>): string | null {
   `;
 }
 
-function buildAdditionalDataCard(enrichment: Record<string, any>): string | null {
-  const extraKeys = Object.keys(enrichment).filter((k) => !CURATED_FIELDS.has(k) && !META_FIELDS.has(k));
-  if (extraKeys.length === 0) return null;
+const DONUT_COLORS = ["#0f6e56", "#5dcaa5", "#378add", "#b6771a", "#d85a30", "#6b4fbb", "#99355a", "#2f7d32", "#26215c", "#7f77dd"];
+
+function buildConsumerStylesDonut(enrichment: Record<string, any>): string | null {
+  const codes = Object.keys(consumerStylesLabels).filter((c) => c in enrichment);
+  if (codes.length < 2) return null;
+  const entries = codes
+    .map((c) => ({ code: c, label: consumerStylesLabels[c], value: Number(enrichment[c]) || 0 }))
+    .sort((a, b) => b.value - a.value);
+  const total = entries.reduce((s, e) => s + e.value, 0) || 1;
+
+  let cumulative = 0;
+  const stops = entries
+    .map((e, i) => {
+      const startPct = (cumulative / total) * 100;
+      cumulative += e.value;
+      const endPct = (cumulative / total) * 100;
+      return `${DONUT_COLORS[i % DONUT_COLORS.length]} ${startPct}% ${endPct}%`;
+    })
+    .join(", ");
+
   return `
-    <table>
-      <thead><tr><th>Variable</th><th>Value</th></tr></thead>
-      <tbody>
-        ${extraKeys.map((k) => `<tr><td>${ALL_VARIABLE_LABELS[k] ?? k}</td><td>${typeof enrichment[k] === "number" ? formatInt(enrichment[k]) : enrichment[k]}</td></tr>`).join("")}
-      </tbody>
-    </table>
+    <div class="donut-chart" style="background: conic-gradient(${stops});"></div>
+    <div class="donut-legend">
+      ${entries.map((e, i) => `<div class="donut-legend__row"><span class="donut-legend__swatch" style="background:${DONUT_COLORS[i % DONUT_COLORS.length]}"></span>${e.label} — ${((e.value / total) * 100).toFixed(0)}%</div>`).join("")}
+    </div>
   `;
+}
+
+function buildLeftoverStatCards(enrichment: Record<string, any>): { title: string; body: string }[] {
+  const consumerStyleKeys = new Set(Object.keys(consumerStylesLabels));
+  return Object.keys(enrichment)
+    .filter((k) => !CURATED_FIELDS.has(k) && !META_FIELDS.has(k) && !consumerStyleKeys.has(k))
+    .map((k) => {
+      const raw = enrichment[k];
+      const isCurrency = ALL_VARIABLE_UNITS[k] === "currency";
+      const value = typeof raw === "number" ? (isCurrency ? `₹${formatCompact(raw)}` : formatCompact(raw)) : raw;
+      return { title: ALL_VARIABLE_LABELS[k] ?? k, body: `<div class="ai-card__stat">${value}</div>` };
+    });
 }
 
 // -------------------------------------------------------------------------
@@ -373,11 +492,11 @@ function buildAdditionalDataCard(enrichment: Record<string, any>): string | null
 async function renderResults(root: HTMLDivElement, data: any) {
   destroyAllViews();
 
-  const { address, score, location, rawAttributes, elevation, elevationSamples, enrichment, poiByCategory, route: routeData, destination } = data as {
+  const { address, score, location, rawAttributes, elevation, elevationSamples, enrichment, poiByCategory, route: routeData, destination, catchment, catchmentLabel } = data as {
     address: string; score: number; location: { x: number; y: number }; rawAttributes: any;
     elevation: number | null; elevationSamples: number[]; enrichment: Record<string, any> | null;
     poiByCategory: Record<string, PoiResult[]>; route: RouteResult | null;
-    destination: { x: number; y: number; label: string };
+    destination: { x: number; y: number; label: string }; catchment: Catchment; catchmentLabel: string;
   };
   const roughness = stdDev(elevationSamples || []);
   const x = location.x, y = location.y;
@@ -387,7 +506,7 @@ async function renderResults(root: HTMLDivElement, data: any) {
       <div class="logo-dots"><span></span><span></span><span></span><span></span></div>
       <div>
         <div class="result-title">Esri Address Insights</div>
-        <div class="result-subtitle">${address}</div>
+        <div class="result-subtitle">${address} · ${catchmentLabel}</div>
       </div>
     </div>
     <div class="card-grid" id="card-grid"></div>
@@ -404,7 +523,6 @@ async function renderResults(root: HTMLDivElement, data: any) {
     return card;
   }
 
-  // Hero 3D card
   const sceneCard = document.createElement("div");
   sceneCard.className = "ai-card ai-card--scene";
   sceneCard.dataset.kind = "teal";
@@ -425,12 +543,7 @@ async function renderResults(root: HTMLDivElement, data: any) {
   currentSceneView.goTo({ tilt: 45 }, { animate: false });
 
   const basemapGallery = new BasemapGallery({ view: currentSceneView });
-  const basemapExpand = new Expand({
-    view: currentSceneView,
-    content: basemapGallery,
-    expandIcon: "basemap",
-    expandTooltip: "Change basemap",
-  });
+  const basemapExpand = new Expand({ view: currentSceneView, content: basemapGallery, expandIcon: "basemap", expandTooltip: "Change basemap" });
   currentSceneView.ui.add(basemapExpand, "top-right");
 
   addCard("teal", "Match quality", `
@@ -449,18 +562,13 @@ async function renderResults(root: HTMLDivElement, data: any) {
     <div class="ai-card__stat-label">Std. dev. of nearby elevation samples (real, derived)</div>
   `);
 
-  // One real card per selected POI category. Sequential + awaited on
-  // purpose -- firing several MapViews' WebGL contexts in the same
-  // synchronous tick (the old forEach) let some silently fail to render
-  // even though the data was correct.
   for (const [category, pois] of Object.entries(poiByCategory)) {
     const card = addCard("teal", category, `
       <div class="ai-card__stat">${pois.length}</div>
-      <div class="ai-card__stat-label">Found within 1.5 km</div>
+      <div class="ai-card__stat-label">Within ${catchmentLabel}</div>
       <div class="ai-card__minimap"></div>
     `);
-    const view = createPoiMiniMap(card.querySelector(".ai-card__minimap")!, x, y, pois);
-    await view.when();
+    await createPoiMiniMap(card.querySelector(".ai-card__minimap")!, x, y, pois, catchment);
   }
 
   const routeCard = addCard("teal", "Route", `<div class="ai-card__minimap"></div><div class="ai-card__label" id="route-info" style="margin-top:8px">—</div>`);
@@ -469,10 +577,7 @@ async function renderResults(root: HTMLDivElement, data: any) {
 
   if (routeData && routeData.paths.length) {
     const routeLayer = new GraphicsLayer();
-    routeLayer.add(new Graphic({
-      geometry: { type: "polyline", paths: routeData.paths, spatialReference: { wkid: 4326 } } as any,
-      symbol: { type: "simple-line", color: "#0f6e56", width: 3 } as any,
-    }));
+    routeLayer.add(new Graphic({ geometry: { type: "polyline", paths: routeData.paths, spatialReference: { wkid: 4326 } } as any, symbol: { type: "simple-line", color: "#0f6e56", width: 3 } as any }));
     routeLayer.add(pointGraphic(x, y));
     routeLayer.add(pointGraphic(destination.x, destination.y, "#378add"));
 
@@ -495,13 +600,13 @@ async function renderResults(root: HTMLDivElement, data: any) {
     routeInfoDiv.textContent = "Route unavailable — check the Routing privilege on your API key.";
   }
 
-  const demoCard = addCard("teal", "Demographics analysis area", `<div class="ai-card__minimap"></div><div class="ai-card__label" style="margin-top:8px">1-mile buffer used for the enrichment cards below</div>`);
-  createMiniMap(demoCard.querySelector(".ai-card__minimap")!, x, y, 1);
+  const demoCard = addCard("teal", "Demographics analysis area", `<div class="ai-card__minimap"></div><div class="ai-card__label" style="margin-top:8px">${catchmentLabel}, used for the enrichment cards below</div>`);
+  await createMiniMap(demoCard.querySelector(".ai-card__minimap")!, x, y, catchment);
 
   const popHtml = enrichment ? buildNearbyPopulation(enrichment) : null;
   const popCard = addCard("teal", "Nearby population", popHtml ?? `<div class="ai-card__stat-label">No population variables selected, or unavailable — check the Demographics privilege.</div>`);
   const popMinimap = popCard.querySelector(".ai-card__minimap");
-  if (popMinimap) createMiniMap(popMinimap as HTMLDivElement, x, y, 1);
+  if (popMinimap) await createMiniMap(popMinimap as HTMLDivElement, x, y, catchment);
 
   const ppHtml = enrichment ? buildPurchasingPower(enrichment) : null;
   addCard("teal", "Purchasing power", ppHtml ?? `<div class="ai-card__stat-label">No purchasing power / spending variables selected, or unavailable.</div>`);
@@ -509,8 +614,11 @@ async function renderResults(root: HTMLDivElement, data: any) {
   const pyramidHtml = enrichment ? buildAgePyramid(enrichment) : null;
   addCard("teal", "Population by age and sex", pyramidHtml ?? `<div class="ai-card__stat-label">No age-bracket variables selected, or unavailable.</div>`);
 
-  const additionalHtml = enrichment ? buildAdditionalDataCard(enrichment) : null;
-  if (additionalHtml) addCard("teal", "Additional demographics", additionalHtml);
+  if (enrichment) {
+    const donutHtml = buildConsumerStylesDonut(enrichment);
+    if (donutHtml) addCard("purple", "Consumer Styles breakdown", donutHtml);
+    buildLeftoverStatCards(enrichment).forEach(({ title, body }) => addCard("teal", title, body));
+  }
 
   addCard("teal", "Geocoding response", `<pre class="ai-card__json">${JSON.stringify(rawAttributes, null, 2)}</pre>`);
 }

@@ -1,13 +1,10 @@
 import Query from "@arcgis/core/rest/support/Query";
 import * as query from "@arcgis/core/rest/query";
+import type { Catchment } from "./catchment";
 
-// TODO: replace with your actual hosted Feature Service URL + layer index,
-// e.g. "https://services-eu1.arcgis.com/<orgId>/arcgis/rest/services/IndiaBA_POIs/FeatureServer/0"
-// Layer ID confirmed as 0 from the service's metadata.
-export const POI_LAYER_URL = "https://services8.arcgis.com/S3JihvJw7nZLbh8R/arcgis/rest/services/IndiaBA_POIs/FeatureServer/0";
+export const POI_LAYER_URL = "REPLACE_WITH_YOUR_FEATURE_SERVICE_URL/0";
 
 const CATEGORY_FIELD = "ESRI_IND_1";
-
 
 export interface PoiResult {
   name: string;
@@ -18,9 +15,6 @@ export interface PoiResult {
 
 let categoriesPromise: Promise<string[]> | null = null;
 
-// Distinct values are fetched once and cached for the session -- this is
-// layer metadata, not a per-search cost, so it doesn't need repeating on
-// every address search.
 export function fetchPoiCategories(): Promise<string[]> {
   if (!categoriesPromise) {
     categoriesPromise = (async () => {
@@ -32,9 +26,7 @@ export function fetchPoiCategories(): Promise<string[]> {
         orderByFields: [CATEGORY_FIELD],
       });
       const result = await query.executeQueryJSON(POI_LAYER_URL, q);
-      return result.features
-        .map((f) => f.attributes[CATEGORY_FIELD] as string)
-        .filter(Boolean);
+      return result.features.map((f) => f.attributes[CATEGORY_FIELD] as string).filter(Boolean);
     })().catch((err) => {
       console.error("Failed to fetch POI categories -- check POI_LAYER_URL and item access on the API key:", err);
       return [];
@@ -47,33 +39,35 @@ export async function queryNearbyPois(
   x: number,
   y: number,
   category: string,
-  radiusMeters = 1500
+  catchment: Catchment
 ): Promise<PoiResult[]> {
+  const geometryParams =
+    catchment.kind === "polygon"
+      ? {
+          geometry: { rings: catchment.rings, spatialReference: { wkid: 4326 } } as any,
+          spatialRelationship: "intersects" as const,
+        }
+      : {
+          geometry: { type: "point", x, y, spatialReference: { wkid: 4326 } } as any,
+          distance: catchment.km * 1000,
+          units: "meters" as const,
+          spatialRelationship: "intersects" as const,
+        };
+
   const q = new Query({
-    geometry: { type: "point", x, y, spatialReference: { wkid: 4326 } } as any,
-    distance: radiusMeters,
-    units: "meters",
-    spatialRelationship: "intersects",
+    ...geometryParams,
     where: `${CATEGORY_FIELD} = '${category.replace(/'/g, "''")}'`,
     outFields: ["NAME", CATEGORY_FIELD],
     returnGeometry: true,
     outSpatialReference: { wkid: 4326 } as any,
   });
 
-  console.log(`[poi] querying category "${category}" — where: ${q.where}`);
   const result = await query.executeQueryJSON(POI_LAYER_URL, q);
-  console.log(`[poi] "${category}" returned ${result.features.length} feature(s)`);
-  if (result.features[0]) {
-    console.log(`[poi] sample geometry for "${category}":`, result.features[0].geometry);
-  }
 
-  const mapped = result.features
+  return result.features
     .map((f) => {
       const pt = f.geometry as __esri.Point;
       return { name: (f.attributes.NAME as string) || category, category, x: pt?.x, y: pt?.y };
     })
     .filter((p): p is PoiResult => p.x != null && p.y != null);
-
-  console.log(`[poi] "${category}" usable after geometry filter: ${mapped.length}`);
-  return mapped;
 }
