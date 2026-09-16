@@ -11,7 +11,7 @@ import { enrichPoint } from "./services/geoenrichment";
 import { sampleElevation } from "./services/elevation";
 import { solveRoute, type RouteResult } from "./services/routing";
 import { fetchPoiCategories, queryNearbyPois, type PoiResult } from "./services/poi";
-import { solveServiceAreaCatchment, type TravelModeName } from "./services/serviceArea";
+import { solveServiceAreaCatchment } from "./services/serviceArea";
 import type { Catchment } from "./services/catchment";
 import { ENRICHMENT_COLLECTIONS, type EnrichmentCollection } from "./data/enrichmentVariables";
 
@@ -33,18 +33,13 @@ function buildCatchmentPanel(): string {
     <calcite-block heading="Catchment area" description="Defines the area used for enrichment and nearby-place searches" collapsible open>
       <div class="catchment-row">
         <label><input type="radio" name="catchment-type" value="ring" checked> Simple buffer</label>
-        <label><input type="radio" name="catchment-type" value="service-area"> Service area (street network)</label>
+        <label><input type="radio" name="catchment-type" value="service-area"> Service area (10-min walk + 5-min drive)</label>
       </div>
-      <div class="catchment-row">
+      <div class="catchment-row" id="catchment-km-row">
         <span class="catchment-row__label">Distance:</span>
         <label><input type="radio" name="catchment-km" value="1" checked> 1 km</label>
         <label><input type="radio" name="catchment-km" value="3"> 3 km</label>
         <label><input type="radio" name="catchment-km" value="5"> 5 km</label>
-      </div>
-      <div class="catchment-row" id="catchment-mode-row" style="display:none">
-        <span class="catchment-row__label">Mode:</span>
-        <label><input type="radio" name="catchment-mode" value="Walking Distance" checked> Walking</label>
-        <label><input type="radio" name="catchment-mode" value="Driving Distance"> Driving</label>
       </div>
     </calcite-block>
   `;
@@ -53,32 +48,63 @@ function buildCatchmentPanel(): string {
 interface CatchmentSelection {
   type: "ring" | "service-area";
   km: number;
-  mode: TravelModeName;
 }
 
 function getCatchmentSelection(root: HTMLElement): CatchmentSelection {
   const type = ((root.querySelector('input[name="catchment-type"]:checked') as HTMLInputElement)?.value ?? "ring") as "ring" | "service-area";
   const km = Number((root.querySelector('input[name="catchment-km"]:checked') as HTMLInputElement)?.value ?? "1");
-  const mode = ((root.querySelector('input[name="catchment-mode"]:checked') as HTMLInputElement)?.value ?? "Walking Distance") as TravelModeName;
-  return { type, km, mode };
+  return { type, km };
 }
 
-async function resolveCatchment(x: number, y: number, selection: CatchmentSelection): Promise<Catchment> {
-  if (selection.type === "ring") return { kind: "ring", km: selection.km };
-  try {
-    const result = await solveServiceAreaCatchment(x, y, selection.mode, selection.km);
-    if (result) return { kind: "polygon", rings: result.rings };
-    console.warn("Service area solve returned no polygon -- falling back to a ring buffer.");
-  } catch (err) {
-    console.error("Service area solve failed -- check the Routing privilege on your API key:", err);
+interface DemographicCatchment {
+  label: string;
+  catchment: Catchment;
+}
+
+interface ResolvedCatchments {
+  primary: Catchment;
+  primaryLabel: string;
+  summaryLabel: string;
+  demographics: DemographicCatchment[];
+}
+
+async function resolveCatchments(x: number, y: number, selection: CatchmentSelection): Promise<ResolvedCatchments> {
+  if (selection.type === "ring") {
+    const catchment: Catchment = { kind: "ring", km: selection.km };
+    const label = `${selection.km} km buffer`;
+    return { primary: catchment, primaryLabel: label, summaryLabel: label, demographics: [{ label, catchment }] };
   }
-  return { kind: "ring", km: selection.km };
-}
 
-function catchmentLabelFor(selection: CatchmentSelection): string {
-  return selection.type === "ring"
-    ? `${selection.km} km buffer`
-    : `${selection.km} km ${selection.mode.replace(" Distance", "").toLowerCase()} service area`;
+  const [walkResult, driveResult] = await Promise.allSettled([
+    solveServiceAreaCatchment(x, y, "Walking Time", 10),
+    solveServiceAreaCatchment(x, y, "Driving Time", 5),
+  ]);
+
+  let walkCatchment: Catchment;
+  if (walkResult.status === "fulfilled" && walkResult.value) {
+    walkCatchment = { kind: "polygon", rings: walkResult.value.rings };
+  } else {
+    console.error("Walk-time service area failed -- falling back to a 1 km ring.", walkResult.status === "rejected" ? walkResult.reason : "no polygon returned");
+    walkCatchment = { kind: "ring", km: 1 };
+  }
+
+  let driveCatchment: Catchment;
+  if (driveResult.status === "fulfilled" && driveResult.value) {
+    driveCatchment = { kind: "polygon", rings: driveResult.value.rings };
+  } else {
+    console.error("Drive-time service area failed -- falling back to a 3 km ring.", driveResult.status === "rejected" ? driveResult.reason : "no polygon returned");
+    driveCatchment = { kind: "ring", km: 3 };
+  }
+
+  return {
+    primary: walkCatchment,
+    primaryLabel: "10-min walk-time catchment",
+    summaryLabel: "10-min walk + 5-min drive catchments",
+    demographics: [
+      { label: "10-min walk-time catchment", catchment: walkCatchment },
+      { label: "5-min drive-time catchment", catchment: driveCatchment },
+    ],
+  };
 }
 
 function buildVariablePanel(): string {
@@ -158,9 +184,9 @@ export function renderApp(root: HTMLElement) {
 
   root.querySelectorAll('input[name="catchment-type"]').forEach((el) =>
     el.addEventListener("change", () => {
-      const modeRow = root.querySelector("#catchment-mode-row") as HTMLElement;
+      const kmRow = root.querySelector("#catchment-km-row") as HTMLElement;
       const type = (root.querySelector('input[name="catchment-type"]:checked') as HTMLInputElement)?.value;
-      modeRow.style.display = type === "service-area" ? "" : "none";
+      kmRow.style.display = type === "ring" ? "" : "none";
     })
   );
 
@@ -181,7 +207,7 @@ export function renderApp(root: HTMLElement) {
   });
 }
 
-const CACHE_VERSION = "v7";
+const CACHE_VERSION = "v8";
 
 async function runSearch(
   addressText: string,
@@ -192,7 +218,7 @@ async function runSearch(
 ) {
   if (!addressText) return;
 
-  const signature = `${[...variableKeys].sort().join(",")}|${[...poiCategories].sort().join(",")}|${catchmentSelection.type}:${catchmentSelection.km}:${catchmentSelection.mode}`;
+  const signature = `${[...variableKeys].sort().join(",")}|${[...poiCategories].sort().join(",")}|${catchmentSelection.type}:${catchmentSelection.km}`;
   const cacheKey = `address-insights:${CACHE_VERSION}:${addressText.toLowerCase().trim()}:${signature}`;
   const cached = sessionStorage.getItem(cacheKey);
 
@@ -215,24 +241,32 @@ async function runSearch(
       return;
     }
 
-    const catchment = await resolveCatchment(geocoded.location.x, geocoded.location.y, catchmentSelection);
-    const catchmentLabel = catchmentLabelFor(catchmentSelection);
+    const catchments = await resolveCatchments(geocoded.location.x, geocoded.location.y, catchmentSelection);
 
     const destX = geocoded.location.x + 0.02;
     const destY = geocoded.location.y + 0.015;
 
-    const [otherResults, poiSettled] = await Promise.all([
+    const [miscResults, poiSettled, enrichmentSettled] = await Promise.all([
       Promise.allSettled([
         sampleElevation(geocoded.location.x, geocoded.location.y),
         sampleElevationRing(geocoded.location.x, geocoded.location.y),
-        enrichPoint(geocoded.location.x, geocoded.location.y, variableKeys, catchment),
       ]),
-      Promise.allSettled(poiCategories.map((cat) => queryNearbyPois(geocoded.location.x, geocoded.location.y, cat, catchment))),
+      Promise.allSettled(poiCategories.map((cat) => queryNearbyPois(geocoded.location.x, geocoded.location.y, cat, catchments.primary))),
+      Promise.allSettled(catchments.demographics.map((d) => enrichPoint(geocoded.location.x, geocoded.location.y, variableKeys, d.catchment))),
     ]);
 
-    const [elevationResult, ringResult, enrichmentResult] = otherResults;
+    const [elevationResult, ringResult] = miscResults;
     if (elevationResult.status === "rejected") console.error("Elevation failed:", elevationResult.reason);
-    if (enrichmentResult.status === "rejected") console.error("Enrichment failed:", enrichmentResult.reason);
+
+    enrichmentSettled.forEach((r, i) => {
+      if (r.status === "rejected") console.error(`Enrichment failed for "${catchments.demographics[i].label}":`, r.reason);
+    });
+
+    const demographicsSections = catchments.demographics.map((d, i) => ({
+      label: d.label,
+      catchment: d.catchment,
+      enrichment: enrichmentSettled[i].status === "fulfilled" ? (enrichmentSettled[i] as PromiseFulfilledResult<any>).value : null,
+    }));
 
     const poiByCategory: Record<string, PoiResult[]> = {};
     poiCategories.forEach((cat, i) => {
@@ -272,12 +306,13 @@ async function runSearch(
       rawAttributes: (geocoded.raw as any).attributes ?? {},
       elevation: elevationResult.status === "fulfilled" ? elevationResult.value : null,
       elevationSamples: ringResult.status === "fulfilled" ? ringResult.value : [],
-      enrichment: enrichmentResult.status === "fulfilled" ? enrichmentResult.value : null,
+      demographicsSections,
       poiByCategory,
       route: routeResult,
       destination: { x: routeDestX, y: routeDestY, label: destLabel },
-      catchment,
-      catchmentLabel,
+      primaryCatchment: catchments.primary,
+      primaryLabel: catchments.primaryLabel,
+      summaryLabel: catchments.summaryLabel,
     };
 
     sessionStorage.setItem(cacheKey, JSON.stringify(bundle));
@@ -371,23 +406,15 @@ async function createPoiMiniMap(container: HTMLDivElement, x: number, y: number,
   return view;
 }
 
-// --- Enrichment card builders -------------------------------------------
-// One card per data collection. Population, Age, and Consumer Styles get
-// a dedicated chart/visual; every other collection uses a generic
-// hero-stat-plus-rows layout. Special-cased collections still show ANY
-// other selected field from that same collection as extra rows -- an
-// earlier version silently dropped fields outside its hand-picked set.
+// --- Demographic card builders -------------------------------------------
 
 const populationCollection = ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "PopulationEsriIndia")!;
 const ageIncrementsCollection = ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "15YearIncrementsEsriIndia")!;
 const consumerStylesCollection = ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "ConsumerStylesEsriIndia")!;
+const householdsCollection = ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "HouseholdsEsriIndia")!;
+const purchasingPowerCollection = ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "PurchasingPowerEsriIndia")!;
+const spendingCollection = ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "SpendingEsriIndia")!;
 const consumerStylesLabels = Object.fromEntries(consumerStylesCollection.variables.map((v) => [v.id, v.label]));
-
-const SPECIAL_CASED_COLLECTIONS = new Set([
-  populationCollection.collectionId,
-  ageIncrementsCollection.collectionId,
-  consumerStylesCollection.collectionId,
-]);
 
 function buildNearbyPopulation(enrichment: Record<string, any>): string | null {
   const curatedIds = ["TOTPOP_CY", "MALES_CY", "FEMALES_CY", "POPDENS_CY"];
@@ -475,10 +502,7 @@ function buildConsumerStylesDonut(enrichment: Record<string, any>): string | nul
   `;
 }
 
-function buildGenericCollectionCard(
-  collection: EnrichmentCollection,
-  enrichment: Record<string, any>
-): { title: string; body: string } | null {
+function buildGenericCollectionCard(collection: EnrichmentCollection, enrichment: Record<string, any>): { body: string } | null {
   const present = collection.variables.filter((v) => v.id in enrichment);
   if (present.length === 0) return null;
 
@@ -491,7 +515,62 @@ function buildGenericCollectionCard(
     .map((v) => `<div class="ai-card__row"><span>${v.label}</span><b>${formatFieldValue(enrichment[v.id], v.unit)}</b></div>`)
     .join("");
 
-  return { title: collection.label, body: heroHtml + restHtml };
+  return { body: heroHtml + restHtml };
+}
+
+function buildDemographicCards(enrichment: Record<string, any> | null): { kind: string; title: string; body: string }[] {
+  if (!enrichment) {
+    return [{
+      kind: "teal",
+      title: "Demographics",
+      body: `<div class="ai-card__stat-label">No variables selected, or unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`,
+    }];
+  }
+
+  const cards: { kind: string; title: string; body: string }[] = [];
+
+  const popHtml = buildNearbyPopulation(enrichment);
+  if (popHtml) cards.push({ kind: "teal", title: "Population analysis", body: popHtml });
+
+  const donutHtml = buildConsumerStylesDonut(enrichment);
+  if (donutHtml) cards.push({ kind: "purple", title: "Lifestyle segmentation", body: donutHtml });
+
+  const pyramidHtml = buildAgePyramid(enrichment);
+  if (pyramidHtml) cards.push({ kind: "teal", title: "Age-group segmentation", body: pyramidHtml });
+
+  const householdCard = buildGenericCollectionCard(householdsCollection, enrichment);
+  if (householdCard) cards.push({ kind: "teal", title: "Household analysis", body: householdCard.body });
+
+  const incomeCard = buildGenericCollectionCard(purchasingPowerCollection, enrichment);
+  if (incomeCard) cards.push({ kind: "teal", title: "Income-based analysis", body: incomeCard.body });
+
+  const spendingCard = buildGenericCollectionCard(spendingCollection, enrichment);
+  if (spendingCard) cards.push({ kind: "teal", title: "Consumer spending on Food & Beverages", body: spendingCard.body });
+
+  if (cards.length === 0) {
+    return [{ kind: "teal", title: "Demographics", body: `<div class="ai-card__stat-label">No data returned for the selected variables in this catchment.</div>` }];
+  }
+
+  return cards;
+}
+
+async function appendDemographicCards(
+  container: HTMLElement,
+  cards: { kind: string; title: string; body: string }[],
+  x: number,
+  y: number,
+  catchment: Catchment
+) {
+  for (const c of cards) {
+    const card = document.createElement("div");
+    card.className = "ai-card";
+    card.dataset.kind = c.kind;
+    card.innerHTML = `<div class="ai-card__header">${c.title}</div><div class="ai-card__body">${c.body}</div>`;
+    container.appendChild(card);
+
+    const minimap = card.querySelector(".ai-card__minimap");
+    if (minimap) await createMiniMap(minimap as HTMLDivElement, x, y, catchment);
+  }
 }
 
 // -------------------------------------------------------------------------
@@ -499,11 +578,17 @@ function buildGenericCollectionCard(
 async function renderResults(root: HTMLDivElement, data: any) {
   destroyAllViews();
 
-  const { address, score, location, rawAttributes, elevation, elevationSamples, enrichment, poiByCategory, route: routeData, destination, catchment, catchmentLabel } = data as {
+  const {
+    address, score, location, rawAttributes, elevation, elevationSamples,
+    demographicsSections, poiByCategory, route: routeData, destination,
+    primaryCatchment, primaryLabel, summaryLabel,
+  } = data as {
     address: string; score: number; location: { x: number; y: number }; rawAttributes: any;
-    elevation: number | null; elevationSamples: number[]; enrichment: Record<string, any> | null;
+    elevation: number | null; elevationSamples: number[];
+    demographicsSections: { label: string; catchment: Catchment; enrichment: Record<string, any> | null }[];
     poiByCategory: Record<string, PoiResult[]>; route: RouteResult | null;
-    destination: { x: number; y: number; label: string }; catchment: Catchment; catchmentLabel: string;
+    destination: { x: number; y: number; label: string };
+    primaryCatchment: Catchment; primaryLabel: string; summaryLabel: string;
   };
   const roughness = stdDev(elevationSamples || []);
   const x = location.x, y = location.y;
@@ -513,7 +598,7 @@ async function renderResults(root: HTMLDivElement, data: any) {
       <div class="logo-dots"><span></span><span></span><span></span><span></span></div>
       <div>
         <div class="result-title">Esri Address Insights</div>
-        <div class="result-subtitle">${address} · ${catchmentLabel}</div>
+        <div class="result-subtitle">${address} · ${summaryLabel}</div>
       </div>
     </div>
     <div class="card-grid" id="card-grid"></div>
@@ -572,10 +657,10 @@ async function renderResults(root: HTMLDivElement, data: any) {
   for (const [category, pois] of Object.entries(poiByCategory)) {
     const card = addCard("teal", category, `
       <div class="ai-card__stat">${pois.length}</div>
-      <div class="ai-card__stat-label">Within ${catchmentLabel}</div>
+      <div class="ai-card__stat-label">Within ${primaryLabel}</div>
       <div class="ai-card__minimap"></div>
     `);
-    await createPoiMiniMap(card.querySelector(".ai-card__minimap")!, x, y, pois, catchment);
+    await createPoiMiniMap(card.querySelector(".ai-card__minimap")!, x, y, pois, primaryCatchment);
   }
 
   const routeCard = addCard("teal", "Route", `<div class="ai-card__minimap"></div><div class="ai-card__label" id="route-info" style="margin-top:8px">—</div>`);
@@ -607,32 +692,28 @@ async function renderResults(root: HTMLDivElement, data: any) {
     routeInfoDiv.textContent = "Route unavailable — check the Routing privilege on your API key.";
   }
 
-  const demoCard = addCard("teal", "Demographics analysis area", `<div class="ai-card__minimap"></div><div class="ai-card__label" style="margin-top:8px">${catchmentLabel}, used for the enrichment cards below</div>`);
-  await createMiniMap(demoCard.querySelector(".ai-card__minimap")!, x, y, catchment);
+  const demoCard = addCard("teal", "Demographics analysis area", `<div class="ai-card__minimap"></div><div class="ai-card__label" style="margin-top:8px">${primaryLabel}</div>`);
+  await createMiniMap(demoCard.querySelector(".ai-card__minimap")!, x, y, primaryCatchment);
 
-  if (enrichment) {
-    const popHtml = buildNearbyPopulation(enrichment);
-    if (popHtml) {
-      const popCard = addCard("teal", "Population", popHtml);
-      const popMinimap = popCard.querySelector(".ai-card__minimap");
-      if (popMinimap) await createMiniMap(popMinimap as HTMLDivElement, x, y, catchment);
-    }
-
-    const pyramidHtml = buildAgePyramid(enrichment);
-    if (pyramidHtml) addCard("teal", "Population by Age and Sex", pyramidHtml);
-
-    const donutHtml = buildConsumerStylesDonut(enrichment);
-    if (donutHtml) addCard("purple", "Consumer Styles", donutHtml);
-
-    ENRICHMENT_COLLECTIONS
-      .filter((c) => !SPECIAL_CASED_COLLECTIONS.has(c.collectionId))
-      .forEach((c) => {
-        const card = buildGenericCollectionCard(c, enrichment);
-        if (card) addCard("teal", card.title, card.body);
-      });
+  if (demographicsSections.length === 1) {
+    const cards = buildDemographicCards(demographicsSections[0].enrichment);
+    await appendDemographicCards(grid, cards, x, y, demographicsSections[0].catchment);
   } else {
-    addCard("teal", "Demographics", `<div class="ai-card__stat-label">No variables selected, or unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`);
-  }
+    const splitWrap = document.createElement("div");
+    splitWrap.className = "demo-split";
+    root.appendChild(splitWrap);
 
-  addCard("teal", "Geocoding response", `<pre class="ai-card__json">${JSON.stringify(rawAttributes, null, 2)}</pre>`);
+    for (const section of demographicsSections) {
+      const col = document.createElement("div");
+      col.className = "demo-split__col";
+      const heading = document.createElement("div");
+      heading.className = "demo-split__heading";
+      heading.textContent = section.label;
+      col.appendChild(heading);
+      splitWrap.appendChild(col);
+
+      const cards = buildDemographicCards(section.enrichment);
+      await appendDemographicCards(col, cards, x, y, section.catchment);
+    }
+  }
 }

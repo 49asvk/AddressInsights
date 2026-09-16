@@ -2,7 +2,7 @@ import Query from "@arcgis/core/rest/support/Query";
 import * as query from "@arcgis/core/rest/query";
 import type { Catchment } from "./catchment";
 
-export const POI_LAYER_URL = "https://services8.arcgis.com/S3JihvJw7nZLbh8R/arcgis/rest/services/IndiaBA_POIs/FeatureServer/0";
+export const POI_LAYER_URL = "REPLACE_WITH_YOUR_FEATURE_SERVICE_URL/0";
 
 const CATEGORY_FIELD = "ESRI_IND_1";
 
@@ -41,10 +41,15 @@ export async function queryNearbyPois(
   category: string,
   catchment: Catchment
 ): Promise<PoiResult[]> {
+  // The polygon branch was missing `type: "polygon"` -- without it the
+  // geometry literal fails autocast and Query.geometry never actually
+  // gets set, so the spatial filter silently vanishes and every category
+  // query returns up to maxRecordCount (2000) rows with no location
+  // constraint at all. That's the fix here.
   const geometryParams =
     catchment.kind === "polygon"
       ? {
-          geometry: { rings: catchment.rings, spatialReference: { wkid: 4326 } } as any,
+          geometry: { type: "polygon", rings: catchment.rings, spatialReference: { wkid: 4326 } } as any,
           spatialRelationship: "intersects" as const,
         }
       : {

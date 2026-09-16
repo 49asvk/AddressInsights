@@ -8,7 +8,8 @@ import { ARCGIS_API_KEY } from "../config";
 const SERVICE_AREA_URL =
   "https://route-api.arcgis.com/arcgis/rest/services/World/ServiceAreas/NAServer/ServiceArea_World";
 
-export type TravelModeName = "Walking Distance" | "Driving Distance";
+// Fixed to exactly the two presets this app uses -- no longer user-selectable.
+export type TravelModeName = "Walking Time" | "Driving Time";
 
 const travelModeCache = new Map<TravelModeName, any>();
 
@@ -25,11 +26,13 @@ export interface ServiceAreaResult {
   rings: number[][][];
 }
 
+// breakValue is minutes for both current presets -- the unit follows
+// whatever the travel mode's impedance attribute is (time here).
 export async function solveServiceAreaCatchment(
   x: number,
   y: number,
   mode: TravelModeName,
-  km: number
+  breakValue: number
 ): Promise<ServiceAreaResult | null> {
   const travelMode = await getTravelMode(mode);
 
@@ -40,7 +43,7 @@ export async function solveServiceAreaCatchment(
   const params = new ServiceAreaParameters({
     apiKey: ARCGIS_API_KEY,
     facilities: new FeatureSet({ features: [facility] }),
-    defaultBreaks: [km],
+    defaultBreaks: [breakValue],
     travelMode,
     travelDirection: "from-facility",
     outSpatialReference: { wkid: 4326 } as any,
@@ -48,11 +51,6 @@ export async function solveServiceAreaCatchment(
   } as any);
 
   const result = await serviceArea.solve(SERVICE_AREA_URL, params);
-
-  // serviceAreaPolygons is a FeatureSet, not a plain array -- its
-  // polygons live under .features. Indexing it directly (the bug that
-  // shipped last time) always returned undefined and silently triggered
-  // the ring-buffer fallback on every search.
   const polygonGraphic = result.serviceAreaPolygons?.features?.[0];
   const geometry = polygonGraphic?.geometry as __esri.Polygon | undefined;
   if (!geometry?.rings) return null;

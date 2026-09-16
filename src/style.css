@@ -114,3 +114,7 @@ body { margin: 0; font-family: system-ui, sans-serif; background: #f4f3ef; }
 .var-picker { padding: 0 16px; }
 .var-picker-actions { display: flex; gap: 8px; margin-bottom: 10px; }
 .var-checkbox-label { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13px; }
+
+.demo-split { display: flex; gap: 20px; padding: 16px; flex-wrap: wrap; }
+.demo-split__col { flex: 1; min-width: 300px; display: flex; flex-direction: column; gap: 16px; }
+.demo-split__heading { font-weight: 700; font-size: 15px; padding: 4px 2px; border-bottom: 2px solid #0f6e56; margin-bottom: 4px; }
